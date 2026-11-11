@@ -1,11 +1,6 @@
-// Datos de conexión del proyecto de Firebase "olegario-reservas".
-// Firebase los muestra en: Configuración del proyecto > Tus apps > App web > firebaseConfig.
-// No son contraseñas: identifican el proyecto. La seguridad la ponen las reglas de firestore.rules.
-export const FIREBASE_CONFIG = {
-  apiKey: "AIzaSyCWNpbIxznWAxS-1bStjbfzf7Wzn0YfruQ",
-  authDomain: "olegario-reservas.firebaseapp.com",
-  projectId: "olegario-reservas",
-  storageBucket: "olegario-reservas.firebasestorage.app",
-  messagingSenderId: "21995726454",
-  appId: "1:21995726454:web:822c10b20c26df0c6a6157"
-};
+// Dirección de la API del servidor de Olegario (PHP + MySQL, el mismo de la app). Es pública: no es una
+// contraseña. La seguridad la pone el servidor (cada persona entra con su cuenta).
+//   - Vacía: modo prueba (las reservas no se guardan en ningún lado).
+//   - Local con Docker: 'http://localhost:8080'.
+//   - Producción: la dirección del servidor en Hostinger (con https), cuando esté publicado.
+export const API_URL = '';

@@ -1,7 +1,6 @@
-// Olegario Reservas — plano en vivo del coworking con reservas compartidas (Firebase).
-import { FIREBASE_CONFIG } from './config.js';
-
-const FB = 'https://www.gstatic.com/firebasejs/10.12.2/';
+// Olegario Reservas — plano en vivo del coworking. Las reservas se guardan en el servidor de Olegario
+// (PHP + MySQL), el mismo de la app: lo que se reserva acá aparece en la app y descuenta horas del plan.
+import { API_URL } from './config.js';
 
 // ------------------------------------------------------------ datos del espacio (sacados del modelo 3D)
 const OPEN = 8, CLOSE = 20, NDAYS = 3;          // horario de reservas y días hacia adelante
@@ -66,7 +65,8 @@ const store = {
   get(k) { try { return localStorage.getItem(k); } catch { return null; } },
   set(k, v) { try { localStorage.setItem(k, v); } catch { /* sin almacenamiento: no pasa nada */ } },
 };
-const S = { filter: 'todo', day: 0, hour: OPEN, zoom: 1, loaded: false, docs: new Map(), uid: null, sheet: null, name: store.get('olegario_nombre') || '' };
+// uid: 'yo' con sesión (las horas propias se marcan con 'yo'); guest: invitado (mira pero no reserva).
+const S = { filter: 'todo', day: 0, hour: OPEN, zoom: 1, loaded: false, docs: new Map(), uid: null, sheet: null, guest: false, nombre: '' };
 { const h = nowHour(); if (h >= CLOSE) { S.day = 1; S.hour = OPEN; } else S.hour = Math.max(OPEN, h); }
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -102,47 +102,84 @@ function setSlots(list) {
   S.docs = m; S.loaded = true; render();
 }
 
-// ------------------------------------------------------------ backend: Firebase o modo prueba local
-let fb = null;                       // { fs, db } cuando hay Firebase
-const demoSlots = new Map();         // modo prueba
+// ------------------------------------------------------------ backend: servidor de Olegario o modo prueba
+const CON_SERVIDOR = /^https?:\/\//.test(API_URL);
+const demoSlots = new Map();         // modo prueba (sin servidor)
 const newId = () => 'b' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+const TOKEN = 'olegario_token';      // sesión de la cuenta de Olegario en este navegador
+
+// Pedido a la API. Con error, lanza { code, message } con el código y el mensaje en español del servidor.
+async function api(method, path, body) {
+  const token = store.get(TOKEN);
+  let resp;
+  try {
+    resp = await fetch(API_URL.replace(/\/+$/, '') + path, {
+      method,
+      headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch { throw { code: 'unavailable' }; }
+  const data = await resp.json().catch(() => null);
+  if (resp.ok) return data;
+  if (resp.status === 401 && path !== '/cuentas/ingreso' && path !== '/cuentas/canjear-codigo') sinSesion();
+  throw { code: (data && data.codigo) || 'error', message: data && data.error };
+}
+
+// fecha local (AAAA-MM-DD) + hora → instante ISO para el servidor
+const isoAt = (dateKey, h) => { const [y, m, d] = dateKey.split('-').map(Number); return new Date(y, m - 1, d, h).toISOString(); };
+
+// Ocupación de otras personas (sin saber quiénes) y mis reservas → horas sueltas por lugar y día.
+async function load() {
+  if (!S.uid) return;
+  const desde = isoAt(DATES[0], 0), hasta = isoAt(keyOf(new Date(DAYS[NDAYS - 1].getTime() + 86400000)), 0);
+  const [espacios, mias] = await Promise.all([
+    api('GET', `/espacios?desde=${encodeURIComponent(desde)}&hasta=${encodeURIComponent(hasta)}`),
+    api('GET', '/reservas'),
+  ]);
+  const list = [];
+  const marcar = (res, inicio, fin, u, b) => {
+    const a = new Date(inicio), z = new Date(fin);
+    for (const date of DATES) {
+      for (let h = OPEN; h < CLOSE; h++) {
+        const [y, m, d] = date.split('-').map(Number);
+        const h0 = new Date(y, m - 1, d, h), h1 = new Date(y, m - 1, d, h + 1);
+        if (a < h1 && h0 < z) list.push({ date, res, h, u, b });
+      }
+    }
+  };
+  for (const e of espacios) for (const o of e.ocupaciones) marcar(e.id, o.inicio, o.fin, 'otro', 'otro');
+  for (const r of mias) if (!r.cancelada) marcar(r.espacioId, r.inicio, r.fin, 'yo', r.id);
+  setSlots(list);
+}
 
 async function book(res, date, start, dur) {
   for (let h = start; h < start + dur; h++) {
     const st = statusAt(res, date, h);
     if (st !== 'free') throw { code: 'taken', hour: h };
   }
-  const b = newId();
-  if (!fb) {
+  if (!CON_SERVIDOR) {
+    const b = newId();
     for (let h = start; h < start + dur; h++) demoSlots.set(`${date}_${res}_${h}`, { date, res, h, u: S.uid, b });
     setSlots([...demoSlots.values()]); return;
   }
-  const { fs, db } = fb;
-  const batch = fs.writeBatch(db);
-  for (let h = start; h < start + dur; h++) {
-    batch.set(fs.doc(db, 'slots', `${date}_${res}_${h}`), { date, res, h, u: S.uid, b, t: fs.serverTimestamp() });
-  }
-  batch.set(fs.doc(db, 'detalles', b), { u: S.uid, name: S.name.trim(), res, date, start, end: start + dur, t: fs.serverTimestamp() });
-  await batch.commit();             // si alguna hora ya existe, las reglas rechazan todo el lote
+  // El servidor vuelve a controlar todo: lugar libre, horas del plan, anticipación.
+  try { await api('POST', '/reservas', { espacioId: res, inicio: isoAt(date, start), fin: isoAt(date, start + dur) }); }
+  finally { await load().catch(() => {}); }
 }
 async function cancel(g) {
-  if (!fb) {
+  if (!CON_SERVIDOR) {
     for (const h of g.hours) demoSlots.delete(`${g.date}_${g.res}_${h}`);
     setSlots([...demoSlots.values()]); return;
   }
-  const { fs, db } = fb;
-  const batch = fs.writeBatch(db);
-  for (const h of g.hours) batch.delete(fs.doc(db, 'slots', `${g.date}_${g.res}_${h}`));
-  batch.delete(fs.doc(db, 'detalles', g.b));
-  await batch.commit();
+  try { await api('POST', `/reservas/${encodeURIComponent(g.b)}/cancelar`); }
+  finally { await load().catch(() => {}); }
 }
 function errText(e) {
   const code = e && e.code;
   if (code === 'taken') return 'Las ' + hh(e.hour) + ' ya están ocupadas. Elegí otro horario.';
-  if (code === 'permission-denied') return 'Alguien reservó ese horario recién. Elegí otro.';
   if (code === 'unavailable') return 'Sin conexión. Revisá internet y probá de nuevo.';
-  if (code === 'resource-exhausted') return 'El sistema está saturado. Probá en unos minutos.';
-  return 'No se pudo guardar. Probá de nuevo.';
+  // Los demás mensajes los manda el servidor en español (horas del plan, lugar ocupado, cancelación…).
+  return (e && e.message) || 'No se pudo guardar. Probá de nuevo.';
 }
 
 // ------------------------------------------------------------ controles superiores
@@ -264,12 +301,10 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSheet()
 function renderSheet() {
   const st = S.sheet;
   // si se está escribiendo el nombre, no perder el foco cuando llega una actualización en vivo
-  const typing = document.activeElement && document.activeElement.id === 'nombre';
-  const caret = typing ? document.activeElement.selectionStart : 0;
+  if (st.type === 'login') return;   // el formulario de ingreso no se redibuja con las actualizaciones
   const scrollY = $('sheetBody').scrollTop;
   if (st.type === 'mine') renderMine(); else renderRes(st);
   $('sheetBody').scrollTop = scrollY;
-  if (typing && $('nombre')) { $('nombre').focus(); $('nombre').setSelectionRange(caret, caret); }
 }
 
 function renderRes(st) {
@@ -302,9 +337,8 @@ function renderRes(st) {
       <div class="keys"><span><i style="background:var(--surface);box-shadow:inset 0 0 0 1.5px var(--line)"></i>Libre</span><span><i style="background:repeating-linear-gradient(135deg,var(--busy) 0 3px,transparent 3px 6px)"></i>Ocupado</span><span><i style="background:var(--btn)"></i>Tu elección</span><span><i style="background:var(--violet)"></i>Tu reserva</span></div>
     </div>
     ${myHere ? '' : `<div class="sec"><h3>Duración</h3><p class="note">Las reservas son por bloques de una hora, de ${hh(OPEN)} a ${hh(CLOSE)}.</p>
-      <div class="seg" id="seg">${[1, 2, 3, 4].map(d => `<button type="button" data-dur="${d}" aria-pressed="${st.dur === d}" ${st.start + d > CLOSE ? 'disabled' : ''}>${d} h</button>`).join('')}</div></div>
-    <div class="sec field"><label for="nombre">¿A nombre de quién?</label>
-      <input id="nombre" type="text" autocomplete="name" maxlength="60" placeholder="Nombre y apellido" value="${esc(S.name)}"></div>`}`;
+      <div class="seg" id="seg">${[1, 2, 3, 4].map(d => `<button type="button" data-dur="${d}" aria-pressed="${st.dur === d}" ${st.start + d > CLOSE ? 'disabled' : ''}>${d} h</button>`).join('')}</div>
+      ${CON_SERVIDOR && S.nombre ? `<p class="note">Se reserva a nombre de ${esc(S.nombre)} y descuenta horas de tu plan.</p>` : ''}</div>`}`;
   $('bars').onclick = e => {
     const b = e.target.closest('[data-h]'); if (!b || b.disabled) return;
     st.start = +b.dataset.h; st.err = ''; st.confirm = false;
@@ -312,7 +346,6 @@ function renderRes(st) {
     renderSheet();
   };
   if ($('seg')) $('seg').onclick = e => { const b = e.target.closest('[data-dur]'); if (!b || b.disabled) return; st.dur = +b.dataset.dur; st.err = ''; renderSheet(); };
-  if ($('nombre')) $('nombre').oninput = e => { S.name = e.target.value; store.set('olegario_nombre', S.name); renderFoot(st, r, myHere, clash); };
   renderFoot(st, r, myHere, clash);
 }
 
@@ -324,16 +357,19 @@ function renderFoot(st, r, myHere, clash) {
     btn = `<button type="button" class="danger ${st.confirm ? 'confirm' : ''}" id="act">${st.confirm ? 'Sí, cancelar' : 'Cancelar reserva'}</button>`;
   } else {
     let why = '';
-    if (!S.uid) why = 'Conectando…';
+    if (!S.uid) why = CON_SERVIDOR ? 'Ingresá con tu cuenta para reservar.' : 'Conectando…';
+    else if (S.guest) why = 'Para reservar necesitás una cuenta de miembro.';
     else if (clash === CLOSE) why = 'Cerramos a las ' + hh(CLOSE) + '.';
     else if (clash !== null) why = isPast(date, clash) ? 'Las ' + hh(clash) + ' ya pasaron.' : statusAt(r.id, date, clash) === 'mine' ? 'Ya tenés reservadas las ' + hh(clash) + '.' : 'Ocupado a las ' + hh(clash) + '.';
-    else if (S.name.trim().length < 2) why = 'Escribí tu nombre para reservar.';
     const ok = !why && S.loaded;
     left = `<strong>${hh(st.start)} – ${hh(Math.min(CLOSE, st.start + st.dur))}</strong><span>${st.err ? `<span class="err">${esc(st.err)}</span>` : why ? `<span class="err">${esc(why)}</span>` : dayShort(DATES.indexOf(date)) + ' · ' + st.dur + ' h'}</span>`;
-    btn = `<button type="button" class="primary" id="act" ${ok && !st.busy ? '' : 'disabled'}>${st.busy ? 'Reservando…' : 'Reservar'}</button>`;
+    btn = !S.uid && CON_SERVIDOR
+      ? `<button type="button" class="primary" id="act">Ingresar</button>`
+      : `<button type="button" class="primary" id="act" ${ok && !st.busy ? '' : 'disabled'}>${st.busy ? 'Reservando…' : 'Reservar'}</button>`;
   }
   $('sheetFoot').innerHTML = `<div class="sum">${left}</div>${btn}`;
   $('act').onclick = async () => {
+    if (!S.uid && CON_SERVIDOR) { openLogin(); return; }
     if (myHere) {
       if (!st.confirm) { st.confirm = true; renderSheet(); return; }
       try { await cancel(myHere); toast('Cancelaste ' + r.name + ', ' + hh(myHere.start) + '–' + hh(myHere.end)); st.confirm = false; st.err = ''; }
@@ -357,7 +393,7 @@ function renderMine() {
   $('sheetTitle').textContent = 'Mis reservas';
   const list = S.uid ? myBookings() : [];
   if (!list.length) {
-    $('sheetBody').innerHTML = `<p class="empty"><b>Todavía no reservaste nada</b>Elegí un puesto en el cowork o tocá el punto de una sala en el plano. Tus reservas quedan guardadas en este celular.</p>`;
+    $('sheetBody').innerHTML = `<p class="empty"><b>Todavía no reservaste nada</b>Elegí un puesto en el cowork o tocá el punto de una sala en el plano. ${CON_SERVIDOR ? 'Tus reservas también se ven en la app de Olegario.' : 'Modo prueba: las reservas no se guardan.'}</p>`;
   } else {
     $('sheetBody').innerHTML = `<ul class="list">${list.map(g => {
       const r = BY_ID[g.res] || { name: g.res };
@@ -385,7 +421,29 @@ function renderMine() {
     }
   };
 }
-$('mineBtn').onclick = () => openSheet({ type: 'mine', confirm: null, err: '' });
+$('mineBtn').onclick = () => (!S.uid && CON_SERVIDOR ? openLogin() : openSheet({ type: 'mine', confirm: null, err: '' }));
+
+// ------------------------------------------------------------ ingreso con la cuenta de Olegario
+// Desde la app se entra directo (código de un solo uso en el enlace). Si se abre el plano suelto, se
+// ingresa con el mismo correo y contraseña de la app.
+function openLogin(err) {
+  openSheet({ type: 'login' });
+  $('sheetTitle').textContent = 'Ingresá con tu cuenta';
+  $('sheetBody').innerHTML = `
+    <p class="desc">Usá el mismo correo y contraseña de la app de Olegario. Tus reservas se guardan en tu cuenta y descuentan horas de tu plan.</p>
+    <div class="sec field"><label for="correo">Correo</label><input id="correo" type="email" autocomplete="email" maxlength="254" placeholder="tu@correo.com"></div>
+    <div class="sec field"><label for="clave">Contraseña</label><input id="clave" type="password" autocomplete="current-password" maxlength="72"></div>
+    ${err ? `<p class="banner">${esc(err)}</p>` : ''}`;
+  $('sheetFoot').innerHTML = `<div class="sum"><strong>Olegario</strong><span>Tu cuenta de miembro</span></div><button type="button" class="primary" id="act">Ingresar</button>`;
+  $('act').onclick = async () => {
+    $('act').disabled = true; $('act').textContent = 'Ingresando…';
+    try {
+      const r = await api('POST', '/cuentas/ingreso', { correo: $('correo').value.trim(), contrasena: $('clave').value });
+      await entrar(r);
+      closeSheet();
+    } catch (e) { openLogin(errText(e)); }
+  };
+}
 
 let toastT;
 function toast(msg) { const t = $('toast'); t.innerHTML = '<i></i>' + esc(msg); t.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), 3200); }
@@ -398,36 +456,52 @@ sizeMap(false);
 render();
 requestAnimationFrame(() => { const s = scale(); map.scrollLeft = (12.3 - B.x0) * s - map.clientWidth / 2; });
 
+// sesión abierta: guarda el token y carga quién es (los invitados miran pero no reservan)
+async function entrar(r) {
+  store.set(TOKEN, r.token);
+  S.uid = 'yo';
+  S.guest = r.cuenta.tipoAcceso === 'invitado';
+  S.nombre = (r.cuenta.perfil && r.cuenta.perfil.nombre) || '';
+  banner(S.guest ? 'Entraste como invitado: podés mirar el plano. Para reservar, creá tu cuenta en la app.' : '');
+  await load();
+  setLive(true, 'En vivo');
+}
+function sinSesion() {
+  try { localStorage.removeItem(TOKEN); } catch { /* sin almacenamiento */ }
+  S.uid = null; S.guest = false; S.nombre = '';
+  setLive(false, 'Sin sesión');
+  banner('Ingresá con tu cuenta de Olegario para ver tus reservas y reservar.');
+}
+
 async function connect() {
-  if (!FIREBASE_CONFIG.apiKey || FIREBASE_CONFIG.apiKey.startsWith('PEGAR')) {
+  if (!CON_SERVIDOR) {
     S.uid = 'prueba'; setLive(false, 'Modo prueba');
-    banner('Modo prueba: todavía no está conectada a Firebase, así que las reservas no se comparten entre celulares.');
+    banner('Modo prueba: todavía no está conectado al servidor de Olegario, así que las reservas no se guardan.');
     setSlots([]); return;
   }
-  const timer = setTimeout(() => { setLive(false, 'Sin conexión'); banner('No pudimos conectar con las reservas todavía. El plano puede no estar actualizado.'); }, 10000);
   try {
-    const [{ initializeApp }, auth, fs] = await Promise.all([
-      import(FB + 'firebase-app.js'), import(FB + 'firebase-auth.js'), import(FB + 'firebase-firestore.js')]);
-    const app = initializeApp(FIREBASE_CONFIG);
-    const a = auth.getAuth(app);
-    // cada celular entra con una identidad anónima propia: así sabe cuáles reservas son suyas
-    const cred = await auth.signInAnonymously(a);
-    S.uid = cred.user.uid;
-    const db = fs.getFirestore(app);
-    fb = { fs, db };
-    fs.onSnapshot(fs.query(fs.collection(db, 'slots'), fs.where('date', 'in', DATES)), snap => {
-      setSlots(snap.docs.map(d => d.data()));
-      if (!snap.metadata.fromCache) { clearTimeout(timer); setLive(true, 'En vivo'); if (/conectar/.test($('banner').textContent)) banner(''); }
-    }, err => {
-      clearTimeout(timer); console.error(err); setLive(false, 'Sin conexión');
-      banner(err.code === 'permission-denied' ? 'Las reglas de Firebase no dejan leer las reservas. Revisá que estén publicadas.' : 'Se cortó la conexión con las reservas. Recargá la página.');
-    });
+    // ¿Viene desde la app con un código? Se canjea y se borra de la dirección (sirve una sola vez).
+    const url = new URL(location.href);
+    const codigo = url.searchParams.get('codigo');
+    if (codigo) {
+      url.searchParams.delete('codigo');
+      history.replaceState(null, '', url.pathname + url.search + url.hash);
+      await entrar(await api('POST', '/cuentas/canjear-codigo', { codigo }));
+    } else if (store.get(TOKEN)) {
+      const cuenta = await api('GET', '/cuentas/yo');
+      await entrar({ token: store.get(TOKEN), cuenta });
+    } else {
+      sinSesion(); S.loaded = true; render();
+    }
   } catch (e) {
-    clearTimeout(timer); console.error(e); setLive(false, 'Sin conexión');
-    banner(e && (e.code === 'auth/operation-not-allowed' || e.code === 'auth/admin-restricted-operation')
-      ? 'Falta activar el acceso anónimo en Firebase (Authentication > Método de acceso > Anónimo).'
-      : 'No se pudo conectar con las reservas. Revisá la conexión y recargá la página.');
+    console.error(e);
+    if (e && e.code === 'codigo_invalido') { sinSesion(); banner(e.message); }
+    else if (S.uid) { setLive(false, 'Sin conexión'); banner('No se pudo conectar con las reservas. Revisá la conexión y recargá la página.'); }
     S.loaded = true; render();
   }
+  // "En vivo": se actualiza cada 20 segundos (y al volver a la pestaña).
+  const refrescar = () => { if (S.uid && !document.hidden) load().then(() => setLive(true, 'En vivo')).catch(() => setLive(false, 'Sin conexión')); };
+  setInterval(refrescar, 20000);
+  document.addEventListener('visibilitychange', refrescar);
 }
 connect();
